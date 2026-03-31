@@ -1,0 +1,674 @@
+"""
+app.py — Gas Metering Skid Simulator
+Warri-Escravos Pipeline → Scrubber → Heater → PRS → Coriolis Meter
+
+Run locally:    python app.py
+Run on Replit:  python app.py   (host=0.0.0.0, port=8050 auto-configured)
+"""
+
+import dash
+from dash import dcc, html, Input, Output, State
+import plotly.graph_objects as go
+import numpy as np
+
+# Local modules
+import physics as ph
+import process_diagram as pfd
+
+# ---------------------------------------------------------------------------
+# App initialisation
+# ---------------------------------------------------------------------------
+app = dash.Dash(
+    __name__,
+    title="Gas Metering Skid — Warri-Escravos",
+    suppress_callback_exceptions=True,
+)
+server = app.server   # for gunicorn / Replit deployment
+
+
+# ---------------------------------------------------------------------------
+# Styling constants — dark industrial theme
+# ---------------------------------------------------------------------------
+DARK    = "#0d1117"
+PANEL   = "#161b22"
+PANEL2  = "#1c2333"
+BORDER  = "#30363d"
+TEAL    = "#4fc3f7"
+GREEN   = "#66bb6a"
+ORANGE  = "#ff7043"
+YELLOW  = "#ffca28"
+RED     = "#ef5350"
+PURPLE  = "#ce93d8"
+MUTED   = "#8b949e"
+WHITE   = "#e6edf3"
+FONT    = "Consolas, 'Courier New', monospace"
+
+LABEL_STYLE = {
+    "color": TEAL,
+    "fontSize": "11px",
+    "fontFamily": FONT,
+    "letterSpacing": "0.08em",
+    "marginBottom": "4px",
+    "display": "block",
+}
+VALUE_STYLE = {
+    "color": WHITE,
+    "fontSize": "22px",
+    "fontWeight": "bold",
+    "fontFamily": FONT,
+}
+UNIT_STYLE = {
+    "color": MUTED,
+    "fontSize": "12px",
+    "fontFamily": FONT,
+    "marginLeft": "4px",
+}
+
+def card(children, flex=1, min_width="140px"):
+    return html.Div(
+        children,
+        style={
+            "background": PANEL,
+            "border": f"1px solid {BORDER}",
+            "borderRadius": "6px",
+            "padding": "14px 16px",
+            "flex": str(flex),
+            "minWidth": min_width,
+        },
+    )
+
+def section_header(title):
+    return html.Div(
+        title,
+        style={
+            "color": TEAL,
+            "fontFamily": FONT,
+            "fontSize": "11px",
+            "letterSpacing": "0.15em",
+            "textTransform": "uppercase",
+            "borderBottom": f"1px solid {BORDER}",
+            "paddingBottom": "6px",
+            "marginBottom": "14px",
+        },
+    )
+
+def metric_card(label, value_id, unit, color=WHITE, min_width="140px"):
+    return card([
+        html.Span(label, style=LABEL_STYLE),
+        html.Div([
+            html.Span("—", id=value_id, style={**VALUE_STYLE, "color": color}),
+            html.Span(unit, style=UNIT_STYLE),
+        ]),
+    ], min_width=min_width)
+
+def slider_row(label, slider_id, min_v, max_v, step, value, display_id=None):
+    return html.Div([
+        html.Div([
+            html.Span(label, style={**LABEL_STYLE, "marginBottom": "2px"}),
+            html.Span("", id=display_id, style={
+                "color": YELLOW, "fontSize": "12px",
+                "fontFamily": FONT, "marginLeft": "8px",
+            }) if display_id else html.Span(),
+        ], style={"display": "flex", "alignItems": "baseline"}),
+        dcc.Slider(
+            id=slider_id,
+            min=min_v, max=max_v, step=step, value=value,
+            tooltip={"placement": "bottom", "always_visible": False},
+            marks=None,
+            className="custom-slider",
+        ),
+    ], style={"marginBottom": "18px"})
+
+
+# ---------------------------------------------------------------------------
+# Composition inputs (gas chromatograph panel)
+# ---------------------------------------------------------------------------
+def gc_composition_inputs():
+    rows = []
+    for comp, frac in ph.DEFAULT_COMPOSITION.items():
+        rows.append(
+            html.Div([
+                html.Span(comp, style={
+                    "color": MUTED, "fontSize": "11px", "fontFamily": FONT,
+                    "width": "160px", "display": "inline-block",
+                }),
+                dcc.Input(
+                    id=f"gc-{comp.replace(' ', '_').replace('(','').replace(')','').replace('+','')}",
+                    type="number", value=round(frac * 100, 2),
+                    min=0, max=100, step=0.01,
+                    style={
+                        "width": "70px", "background": PANEL2,
+                        "color": WHITE, "border": f"1px solid {BORDER}",
+                        "borderRadius": "4px", "padding": "3px 6px",
+                        "fontFamily": FONT, "fontSize": "12px",
+                    },
+                ),
+                html.Span("mol%", style={
+                    "color": MUTED, "fontSize": "10px",
+                    "fontFamily": FONT, "marginLeft": "4px",
+                }),
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"})
+        )
+    return rows
+
+
+# Unique IDs matching GC input IDs above
+GC_IDS = [
+    f"gc-{c.replace(' ', '_').replace('(','').replace(')','').replace('+','')}"
+    for c in ph.DEFAULT_COMPOSITION
+]
+
+
+# ---------------------------------------------------------------------------
+# App Layout
+# ---------------------------------------------------------------------------
+app.layout = html.Div(
+    style={
+        "background": DARK,
+        "minHeight": "100vh",
+        "fontFamily": FONT,
+        "color": WHITE,
+        "padding": "0",
+    },
+    children=[
+        # === Top header bar ===
+        html.Div(
+            style={
+                "background": PANEL,
+                "borderBottom": f"2px solid {TEAL}",
+                "padding": "10px 24px",
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "space-between",
+            },
+            children=[
+                html.Div([
+                    html.Span("⬡ ", style={"color": TEAL, "fontSize": "20px"}),
+                    html.Span("GAS METERING SKID SIMULATOR", style={
+                        "color": TEAL, "fontSize": "15px", "fontWeight": "bold",
+                        "letterSpacing": "0.12em",
+                    }),
+                    html.Span("  |  Warri-Escravos Pipeline • Lagos, Nigeria", style={
+                        "color": MUTED, "fontSize": "11px", "marginLeft": "8px",
+                    }),
+                ]),
+                html.Div([
+                    html.Span("● ONLINE", style={
+                        "color": GREEN, "fontSize": "11px", "marginRight": "20px",
+                    }),
+                    html.Span("REV 2.0 — CORIOLIS METERING", style={
+                        "color": MUTED, "fontSize": "10px", "letterSpacing": "0.1em",
+                    }),
+                ]),
+            ],
+        ),
+
+        # === Main content ===
+        html.Div(
+            style={"padding": "16px 20px"},
+            children=[
+
+                # ── Row 1: Process Flow Diagram ──
+                html.Div(
+                    style={
+                        "background": PANEL, "border": f"1px solid {BORDER}",
+                        "borderRadius": "8px", "marginBottom": "14px",
+                        "padding": "4px",
+                    },
+                    children=[
+                        dcc.Graph(
+                            id="pfd-graph",
+                            config={"displayModeBar": False},
+                            style={"height": "420px"},
+                        ),
+                    ],
+                ),
+
+                # ── Row 2: Control Panel + Engineering Insights ──
+                html.Div(
+                    style={"display": "flex", "gap": "14px", "marginBottom": "14px", "flexWrap": "wrap"},
+                    children=[
+
+                        # Left: Control Panel
+                        html.Div(
+                            style={
+                                "background": PANEL, "border": f"1px solid {BORDER}",
+                                "borderRadius": "8px", "padding": "16px",
+                                "flex": "0 0 320px",
+                            },
+                            children=[
+                                section_header("⚙  Control Panel"),
+
+                                slider_row(
+                                    "UPSTREAM PRESSURE",
+                                    "input-pressure", 30, 100, 0.5, 55.0,
+                                    display_id="disp-pressure"
+                                ),
+                                slider_row(
+                                    "UPSTREAM TEMPERATURE",
+                                    "input-temperature", 10, 60, 0.5, 32.0,
+                                    display_id="disp-temperature"
+                                ),
+                                slider_row(
+                                    "HEATER SETPOINT",
+                                    "input-heater", 30, 80, 1, 50.0,
+                                    display_id="disp-heater"
+                                ),
+                                slider_row(
+                                    "CONTROL VALVE OPENING",
+                                    "input-valve", 5, 100, 1, 65.0,
+                                    display_id="disp-valve"
+                                ),
+                                slider_row(
+                                    "TARGET DOWNSTREAM PRESSURE (bar)",
+                                    "input-setpoint", 10, 40, 0.5, 19.0,
+                                    display_id="disp-setpoint"
+                                ),
+
+                                html.Div(
+                                    id="alert-panel",
+                                    style={"marginTop": "8px", "minHeight": "40px"},
+                                ),
+                            ],
+                        ),
+
+                        # Right: Engineering Insights
+                        html.Div(
+                            style={"flex": "1", "display": "flex", "flexDirection": "column", "gap": "12px"},
+                            children=[
+
+                                # Metering row
+                                html.Div([
+                                    section_header("📊  Metering & Flow"),
+                                    html.Div(
+                                        style={"display": "flex", "flexWrap": "wrap", "gap": "10px"},
+                                        children=[
+                                            metric_card("Mass Flow Rate", "out-mass-flow", "kg/s", GREEN),
+                                            metric_card("Mass Flow", "out-mass-tph", "t/h", GREEN),
+                                            metric_card("Std Vol Flow", "out-qstd-m3h", "Sm³/h", TEAL),
+                                            metric_card("Std Vol Flow", "out-qstd-mmscfd", "MMSm³/d", TEAL),
+                                            metric_card("Line Vol Flow", "out-qline", "m³/s", MUTED),
+                                        ],
+                                    ),
+                                ], style={
+                                    "background": PANEL, "border": f"1px solid {BORDER}",
+                                    "borderRadius": "8px", "padding": "14px",
+                                }),
+
+                                # Process conditions row
+                                html.Div([
+                                    section_header("🌡  Process Conditions"),
+                                    html.Div(
+                                        style={"display": "flex", "flexWrap": "wrap", "gap": "10px"},
+                                        children=[
+                                            metric_card("Gas Density (line)", "out-rho-line", "kg/m³", ORANGE),
+                                            metric_card("Gas Density (std)", "out-rho-std", "kg/m³", ORANGE),
+                                            metric_card("Z-Factor", "out-z", "", YELLOW),
+                                            metric_card("Mol. Weight", "out-mw", "g/mol", YELLOW),
+                                            metric_card("Downstream P", "out-p-ds", "bar", TEAL),
+                                            metric_card("Downstream T", "out-t-ds", "°C", ORANGE),
+                                        ],
+                                    ),
+                                ], style={
+                                    "background": PANEL, "border": f"1px solid {BORDER}",
+                                    "borderRadius": "8px", "padding": "14px",
+                                }),
+
+                                # Energy row
+                                html.Div([
+                                    section_header("⚡  Energy & Calorific Value"),
+                                    html.Div(
+                                        style={"display": "flex", "flexWrap": "wrap", "gap": "10px"},
+                                        children=[
+                                            metric_card("HHV (mixture)", "out-hhv", "MJ/Sm³", PURPLE),
+                                            metric_card("Energy Flow", "out-energy-mw", "MW", PURPLE),
+                                            metric_card("Energy Flow", "out-energy-gj", "GJ/day", PURPLE),
+                                            metric_card("Wobbe Index", "out-wobbe", "MJ/Sm³", PURPLE),
+                                        ],
+                                    ),
+                                ], style={
+                                    "background": PANEL, "border": f"1px solid {BORDER}",
+                                    "borderRadius": "8px", "padding": "14px",
+                                }),
+                            ],
+                        ),
+                    ],
+                ),
+
+                # ── Row 3: GC Composition + Trend Plots ──
+                html.Div(
+                    style={"display": "flex", "gap": "14px", "flexWrap": "wrap"},
+                    children=[
+
+                        # GC Composition
+                        html.Div(
+                            style={
+                                "background": PANEL, "border": f"1px solid {BORDER}",
+                                "borderRadius": "8px", "padding": "16px",
+                                "flex": "0 0 300px",
+                            },
+                            children=[
+                                section_header("🔬  Gas Chromatograph (GC)"),
+                                html.P(
+                                    "Enter mole fractions from GC analysis.",
+                                    style={"color": MUTED, "fontSize": "10px", "marginBottom": "10px"},
+                                ),
+                                *gc_composition_inputs(),
+                                html.Div(id="gc-total", style={
+                                    "borderTop": f"1px solid {BORDER}",
+                                    "marginTop": "8px", "paddingTop": "6px",
+                                    "color": YELLOW, "fontSize": "11px",
+                                }),
+                            ],
+                        ),
+
+                        # Trend chart — pressure profile
+                        html.Div([
+                            section_header("📈  Pressure Profile"),
+                            dcc.Graph(
+                                id="pressure-profile-chart",
+                                config={"displayModeBar": False},
+                                style={"height": "240px"},
+                            ),
+                        ], style={
+                            "background": PANEL, "border": f"1px solid {BORDER}",
+                            "borderRadius": "8px", "padding": "14px",
+                            "flex": "1", "minWidth": "300px",
+                        }),
+
+                        # Composition pie chart
+                        html.Div([
+                            section_header("🥧  Gas Composition"),
+                            dcc.Graph(
+                                id="composition-pie",
+                                config={"displayModeBar": False},
+                                style={"height": "240px"},
+                            ),
+                        ], style={
+                            "background": PANEL, "border": f"1px solid {BORDER}",
+                            "borderRadius": "8px", "padding": "14px",
+                            "flex": "0 0 280px",
+                        }),
+                    ],
+                ),
+
+                # Footer
+                html.Div(
+                    "Gas Metering Skid Simulator v2.0 | Coriolis + GC Model | Warri-Escravos, Nigeria | Not for custody transfer use without validation",
+                    style={
+                        "color": MUTED, "fontSize": "10px",
+                        "textAlign": "center", "marginTop": "16px",
+                        "paddingTop": "10px", "borderTop": f"1px solid {BORDER}",
+                    },
+                ),
+            ],
+        ),
+
+        # Hidden store for keeping intermediate calc state
+        dcc.Store(id="calc-store"),
+
+        # Interval for live clock (optional)
+        dcc.Interval(id="interval", interval=2000, n_intervals=0),
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# Utility: build composition dict from GC inputs
+# ---------------------------------------------------------------------------
+def parse_gc_inputs(gc_values):
+    comp = {}
+    keys = list(ph.DEFAULT_COMPOSITION.keys())
+    for i, k in enumerate(keys):
+        v = gc_values[i]
+        comp[k] = (v if v is not None else ph.DEFAULT_COMPOSITION[k] * 100) / 100.0
+    # Normalise to sum = 1
+    total = sum(comp.values())
+    if total > 0:
+        comp = {k: v / total for k, v in comp.items()}
+    return comp
+
+
+# ---------------------------------------------------------------------------
+# Master calculation callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    # Process flow diagram
+    Output("pfd-graph", "figure"),
+    # Slider displays
+    Output("disp-pressure", "children"),
+    Output("disp-temperature", "children"),
+    Output("disp-heater", "children"),
+    Output("disp-valve", "children"),
+    Output("disp-setpoint", "children"),
+    # Metering outputs
+    Output("out-mass-flow", "children"),
+    Output("out-mass-tph", "children"),
+    Output("out-qstd-m3h", "children"),
+    Output("out-qstd-mmscfd", "children"),
+    Output("out-qline", "children"),
+    # Process conditions
+    Output("out-rho-line", "children"),
+    Output("out-rho-std", "children"),
+    Output("out-z", "children"),
+    Output("out-mw", "children"),
+    Output("out-p-ds", "children"),
+    Output("out-t-ds", "children"),
+    # Energy
+    Output("out-hhv", "children"),
+    Output("out-energy-mw", "children"),
+    Output("out-energy-gj", "children"),
+    Output("out-wobbe", "children"),
+    # Alerts
+    Output("alert-panel", "children"),
+    # GC total
+    Output("gc-total", "children"),
+    # Charts
+    Output("pressure-profile-chart", "figure"),
+    Output("composition-pie", "figure"),
+
+    # Inputs
+    Input("input-pressure", "value"),
+    Input("input-temperature", "value"),
+    Input("input-heater", "value"),
+    Input("input-valve", "value"),
+    Input("input-setpoint", "value"),
+    *[Input(gid, "value") for gid in GC_IDS],
+)
+def master_calculate(
+    P_up_bar, T_up_c, T_heater_c, valve_pct, P_setpoint_bar,
+    *gc_vals
+):
+    # ── 1. Parse GC composition ──
+    composition = parse_gc_inputs(list(gc_vals))
+    gc_total = sum(v * 100 for v in composition.values())
+
+    # ── 2. Physical properties ──
+    Mw = ph.mixture_mw(composition)
+    Tpc, Ppc = ph.pseudo_critical_properties(composition)
+
+    # ── 3. Scrubber ──
+    P_scr, T_scr, _ = ph.scrubber_model(P_up_bar, T_up_c)
+
+    # ── 4. Heater ──
+    P_htr, T_htr, T_hydrate, hydrate_risk = ph.heater_model(P_scr, T_scr, T_heater_c)
+
+    # ── 5. Control valve ──
+    P_ds, T_ds, dP_valve, Cv = ph.control_valve_model(
+        P_htr, T_htr, valve_pct, P_setpoint_bar
+    )
+
+    # ── 6. Z-factor at downstream conditions ──
+    Z = ph.z_factor_papay(P_ds * 1e5, T_ds + 273.15, Tpc, Ppc)
+
+    # ── 7. Mass flow from hydraulics ──
+    T_avg_k = (T_htr + T_ds) / 2 + 273.15
+    Z_avg   = ph.z_factor_papay((P_htr + P_ds) / 2 * 1e5, T_avg_k, Tpc, Ppc)
+    mass_flow = ph.upstream_mass_flow(P_htr, P_ds, T_avg_k, Mw, Z_avg)
+
+    # ── 8. Coriolis meter readings ──
+    meter = ph.coriolis_meter(P_ds, T_ds, mass_flow, Mw, Z)
+
+    # ── 9. Energy flow ──
+    energy = ph.energy_flow(meter["Q_std_m3h"], composition)
+    HHV    = energy["HHV_mix_MJ_Sm3"]
+    WI     = ph.wobbe_index(HHV, Mw)
+
+    # ── 10. Alerts ──
+    alerts = []
+    if hydrate_risk:
+        alerts.append(html.Div(
+            f"⚠ HYDRATE RISK — T_hydrate ≈ {T_hydrate:.1f}°C, outlet {T_htr:.1f}°C",
+            style={"color": RED, "fontSize": "11px", "fontFamily": FONT,
+                   "background": "#2a0a0a", "border": f"1px solid {RED}",
+                   "borderRadius": "4px", "padding": "6px 10px", "marginBottom": "6px"},
+        ))
+    if P_ds < P_setpoint_bar - 1.5:
+        alerts.append(html.Div(
+            f"⚠ PRESSURE LOW — DS: {P_ds:.1f} bar (setpoint {P_setpoint_bar:.0f} bar)",
+            style={"color": YELLOW, "fontSize": "11px", "fontFamily": FONT,
+                   "background": "#2a2000", "border": f"1px solid {YELLOW}",
+                   "borderRadius": "4px", "padding": "6px 10px", "marginBottom": "6px"},
+        ))
+    if valve_pct > 90:
+        alerts.append(html.Div(
+            f"⚠ VALVE NEAR FULL OPEN ({valve_pct:.0f}%) — check upstream supply",
+            style={"color": YELLOW, "fontSize": "11px", "fontFamily": FONT,
+                   "background": "#2a2000", "border": f"1px solid {YELLOW}",
+                   "borderRadius": "4px", "padding": "6px 10px"},
+        ))
+    if not alerts:
+        alerts.append(html.Div(
+            "✓ All systems normal",
+            style={"color": GREEN, "fontSize": "11px", "fontFamily": FONT},
+        ))
+
+    gc_total_text = f"TOTAL: {gc_total:.2f} mol% {'✓ OK' if abs(gc_total - 100) < 0.5 else '⚠ CHECK'}"
+
+    # ── 11. PFD figure ──
+    pfd_fig = pfd.build_pfd(
+        P_upstream=P_up_bar,
+        P_after_scrubber=P_scr,
+        P_after_heater=P_htr,
+        P_downstream=P_ds,
+        T_after_heater=T_htr,
+        valve_opening=valve_pct,
+        hydrate_risk=hydrate_risk,
+        mass_flow_kg_s=mass_flow,
+        Q_std_m3h=meter["Q_std_m3h"],
+    )
+
+    # ── 12. Pressure profile chart ──
+    pp_fig = _build_pressure_profile(P_up_bar, P_scr, P_htr, P_ds, P_setpoint_bar)
+
+    # ── 13. Composition pie ──
+    pie_fig = _build_composition_pie(composition)
+
+    return (
+        pfd_fig,
+        # Slider displays
+        f"{P_up_bar:.1f} bar",
+        f"{T_up_c:.1f} °C",
+        f"{T_heater_c:.0f} °C setpoint",
+        f"{valve_pct:.0f}%",
+        f"{P_setpoint_bar:.1f} bar",
+        # Metering
+        f"{meter['mass_flow_kg_s']:.3f}",
+        f"{meter['mass_flow_tph']:.2f}",
+        f"{meter['Q_std_m3h']:,.0f}",
+        f"{meter['Q_std_mmscfd']:.4f}",
+        f"{meter['Q_line_m3s']:.4f}",
+        # Process
+        f"{meter['rho_line_kg_m3']:.4f}",
+        f"{meter['rho_std_kg_m3']:.4f}",
+        f"{Z:.4f}",
+        f"{Mw:.3f}",
+        f"{P_ds:.2f}",
+        f"{T_ds:.1f}",
+        # Energy
+        f"{HHV:.3f}",
+        f"{energy['energy_MW']:.2f}",
+        f"{energy['energy_GJ_day']:.1f}",
+        f"{WI:.3f}",
+        # Alerts + GC total
+        alerts,
+        gc_total_text,
+        # Charts
+        pp_fig,
+        pie_fig,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pressure profile bar chart
+# ---------------------------------------------------------------------------
+def _build_pressure_profile(P_up, P_scr, P_htr, P_ds, P_setpoint):
+    stages = ["Upstream<br>(Pipeline)", "After<br>Scrubber", "After<br>Heater", "Downstream<br>(Custody)"]
+    values = [P_up, P_scr, P_htr, P_ds]
+    colors = [pfd.C_PIPE, pfd.C_PIPE, pfd.C_PIPE_HOT, pfd.C_OK]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=stages, y=values,
+        marker_color=colors,
+        text=[f"{v:.1f}" for v in values],
+        textposition="outside",
+        textfont=dict(color=pfd.C_TEXT, size=11, family=FONT),
+    ))
+    fig.add_hline(
+        y=P_setpoint, line_dash="dash",
+        line_color=pfd.C_WARN, line_width=1.5,
+        annotation_text=f"Setpoint {P_setpoint:.0f} bar",
+        annotation_font_color=pfd.C_WARN,
+        annotation_font_size=10,
+    )
+    fig.update_layout(
+        paper_bgcolor=pfd.C_BG, plot_bgcolor=pfd.C_BG,
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(
+            title="Pressure (bar)", color=MUTED,
+            gridcolor=pfd.C_GRID, titlefont_size=10,
+            tickfont=dict(size=10, color=MUTED, family=FONT),
+        ),
+        xaxis=dict(
+            tickfont=dict(size=10, color=MUTED, family=FONT),
+            gridcolor=pfd.C_GRID,
+        ),
+        showlegend=False,
+        font=dict(family=FONT),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Composition pie chart
+# ---------------------------------------------------------------------------
+def _build_composition_pie(composition):
+    labels = list(composition.keys())
+    values = [v * 100 for v in composition.values()]
+    colors = [
+        "#4fc3f7", "#ff7043", "#66bb6a", "#ffca28",
+        "#ce93d8", "#80cbc4", "#ef9a9a", "#a5d6a7",
+    ]
+    fig = go.Figure(go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.4,
+        marker=dict(colors=colors, line=dict(color=pfd.C_BG, width=1)),
+        textfont=dict(size=9, family=FONT),
+        textinfo="label+percent",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        paper_bgcolor=pfd.C_BG, plot_bgcolor=pfd.C_BG,
+        margin=dict(l=0, r=0, t=0, b=0),
+        font=dict(color=WHITE, family=FONT),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    app.run(debug=False)
